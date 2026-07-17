@@ -130,6 +130,11 @@ def verify_memory(c, host=DEFAULT_HOST, user=DEFAULT_USER, key=DEFAULT_KEY):
     """Curl /health and a live 1024-dim embedding through the running service."""
     conn = _conn(host, user, key)
     conn.run(f"systemctl --user is-active {SERVICE}")
+    # Type=simple → is-active flips before uvicorn binds the port; wait for /health.
+    conn.run(
+        f"for i in $(seq 1 20); do "
+        f"curl -sf localhost:{ADAPTER_PORT}/health >/dev/null 2>&1 && break; sleep 1; done"
+    )
     conn.run(f"curl -sS --max-time 10 localhost:{ADAPTER_PORT}/health && echo")
     conn.run(
         f"curl -sS --max-time 30 localhost:{ADAPTER_PORT}/v1/embeddings "
