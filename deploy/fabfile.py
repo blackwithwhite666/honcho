@@ -142,3 +142,148 @@ def verify_memory(c, host=DEFAULT_HOST, user=DEFAULT_USER, key=DEFAULT_KEY):
         "| python3 -c 'import json,sys; d=json.load(sys.stdin); "
         "print(\"embedding dim:\", len(d[\"data\"][0][\"embedding\"]))'"
     )
+
+
+# --------------------------------------------------------------------------- #
+# honcho stack (Postgres + api + deriver) — bare-metal, one fab flow with the adapter
+# --------------------------------------------------------------------------- #
+HONCHO_REMOTE = f"{REMOTE_DIR}/honcho"          # ~/memory/honcho (uv .venv lives here)
+_HONCHO_ROOT = _LOCAL_DIR.parent                # the honcho repo root (deploy/..)
+PG_PACKAGES = "postgresql postgresql-16-pgvector"
+PG_DB = "honcho"
+PG_ROLE = "honcho"
+PG_DSN_FILE = f"{REMOTE_DIR}/.pg_dsn"
+HONCHO_API_PORT = 8000
+EMBED_DIM = 1024
+HONCHO_API_SERVICE = "honcho-api.service"
+HONCHO_DERIVER_SERVICE = "honcho-deriver.service"
+UV = "~/.local/bin/uv"
+
+# honcho .env — LLM + embeddings both point at the adapter; full deriver loop on.
+# `$DSN`/`$JWT` are shell-expanded on the host (secrets never touch the repo).
+_HONCHO_ENV_LINES = [
+    "DB_CONNECTION_URI=$DSN",
+    f"LLM_OPENAI_BASE_URL=http://127.0.0.1:{ADAPTER_PORT}/v1",
+    "LLM_OPENAI_API_KEY=sk-codex-adapter",
+    "EMBEDDING_MODEL_CONFIG__TRANSPORT=openai",
+    "EMBEDDING_MODEL_CONFIG__MODEL=bge-m3",
+    f"EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:{ADAPTER_PORT}/v1",
+    f"EMBEDDING_VECTOR_DIMENSIONS={EMBED_DIM}",
+    "EMBED_MESSAGES=true",
+    "AUTH_USE_AUTH=true",
+    "AUTH_JWT_SECRET=$JWT",
+    "DERIVER_ENABLED=true",
+    "DERIVER_WORKERS=1",
+    # 0 = derive as soon as a message lands (default 512 tokens / 1800s age = laggy)
+    "DERIVER_REPRESENTATION_BATCH_WORK_UNIT_TARGET_TOKENS=0",
+    "SUMMARY_ENABLED=true",
+    "DREAM_ENABLED=true",
+    "PEER_CARD_ENABLED=true",
+    "CACHE_ENABLED=false",
+]
+
+
+def _rsync_honcho(host, user, key):
+    """Push the honcho repo (source only) to the hub; the adapter is separate."""
+    ssh = f"ssh -i {os.path.expanduser(key)}"
+    # --exclude .env / .venv: host-only runtime files not in the repo — --delete
+    # must NOT wipe them (losing .env would rotate the JWT/DB secret on redeploy).
+    subprocess.run(
+        ["rsync", "-az", "--delete", "-e", ssh,
+         "--exclude", ".git", "--exclude", ".venv", "--exclude", "__pycache__",
+         "--exclude", "node_modules", "--exclude", "deploy/", "--exclude", ".env",
+         f"{_HONCHO_ROOT}/", f"{user}@{host}:{HONCHO_REMOTE}/"],
+        check=True,
+    )
+
+
+def _honcho_unit(desc, execstart):
+    return "\n".join([
+        "[Unit]", f"Description={desc}",
+        "After=network-online.target", "Wants=network-online.target",
+        "", "[Service]", "Type=simple", f"WorkingDirectory={HONCHO_REMOTE}",
+        f"ExecStart={execstart}", "Restart=on-failure", "RestartSec=5",
+        "", "[Install]", "WantedBy=default.target", "",
+    ])
+
+
+@task
+def deploy_honcho(c, host=DEFAULT_HOST, user=DEFAULT_USER, key=DEFAULT_KEY, reinstall=True):
+    """Provision Postgres+pgvector@1024 + honcho api/deriver as systemd units.
+
+    Idempotent: reuses an existing DB role/password (`~/memory/.pg_dsn`) and `.env`
+    (so re-runs never rotate the JWT / DB secret), and skips the embedding-dim ALTER
+    when the schema is already at 1024. Run `deploy-memory` first (the adapter the
+    LLM + embeddings point at). See agents-playgroud adrs/honcho-memory-service.md.
+    """
+    conn = _conn(host, user, key)
+
+    # 1. Postgres 16 + pgvector; honcho role/db + vector ext; DSN (first run only).
+    conn.run(f"sudo -n apt-get install -y {PG_PACKAGES}")
+    conn.run("sudo -n systemctl enable --now postgresql")
+    conn.run(
+        f"if [ ! -f {PG_DSN_FILE} ]; then PGPW=$(openssl rand -hex 16); "
+        f"sudo -n -u postgres psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{PG_ROLE}'\" | grep -q 1 || "
+        f"sudo -n -u postgres psql -qc \"CREATE USER {PG_ROLE} WITH PASSWORD '$PGPW';\"; "
+        f"sudo -n -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='{PG_DB}'\" | grep -q 1 || "
+        f"sudo -n -u postgres psql -qc \"CREATE DATABASE {PG_DB} OWNER {PG_ROLE};\"; "
+        f"echo \"postgresql+psycopg://{PG_ROLE}:$PGPW@localhost:5432/{PG_DB}\" > {PG_DSN_FILE}; "
+        f"chmod 600 {PG_DSN_FILE}; fi"
+    )
+    conn.run(f"sudo -n -u postgres psql -d {PG_DB} -qc 'CREATE EXTENSION IF NOT EXISTS vector;'")
+
+    # 2. source + uv sync.
+    conn.run(f"mkdir -p {HONCHO_REMOTE}")
+    _rsync_honcho(host, user, key)
+    conn.run("command -v uv >/dev/null 2>&1 || pipx install uv", warn=True)
+    if reinstall:
+        conn.run(f"cd {HONCHO_REMOTE} && {UV} sync --frozen --no-group dev")
+
+    # 3. .env — first run only (keeps JWT + DB password stable across redeploys).
+    printf_args = " ".join(f'"{line}"' for line in _HONCHO_ENV_LINES)
+    conn.run(
+        f"if [ ! -f {HONCHO_REMOTE}/.env ]; then DSN=$(cat {PG_DSN_FILE}); JWT=$(openssl rand -hex 32); "
+        f"printf '%s\\n' {printf_args} > {HONCHO_REMOTE}/.env && chmod 600 {HONCHO_REMOTE}/.env; fi"
+    )
+
+    # 4. provision @ 1024 (alembic idempotent; ALTER dim only if not already 1024).
+    conn.run(f"cd {HONCHO_REMOTE} && {UV} run python scripts/provision_db.py")
+    conn.run(
+        f"DIM=$(sudo -n -u postgres psql -d {PG_DB} -tAc "
+        f"\"SELECT format_type(atttypid,atttypmod) FROM pg_attribute "
+        f"WHERE attrelid='public.message_embeddings'::regclass AND attname='embedding'\" 2>/dev/null); "
+        f"if [ \"$DIM\" = \"vector({EMBED_DIM})\" ]; then echo \"dim already {EMBED_DIM}\"; "
+        f"else cd {HONCHO_REMOTE} && {UV} run python scripts/configure_embeddings.py --yes; fi"
+    )
+
+    # 5. systemd --user units under linger.
+    conn.run("mkdir -p ~/.config/systemd/user")
+    conn.run(f"loginctl enable-linger {user}", warn=True)
+    units = {
+        HONCHO_API_SERVICE: _honcho_unit(
+            "honcho API",
+            f"{HONCHO_REMOTE}/.venv/bin/fastapi run src/main.py "
+            f"--host 127.0.0.1 --port {HONCHO_API_PORT}"),
+        HONCHO_DERIVER_SERVICE: _honcho_unit(
+            "honcho deriver (representation + dream + reconciler)",
+            f"{HONCHO_REMOTE}/.venv/bin/python -m src.deriver"),
+    }
+    for name, text in units.items():
+        conn.run(f"printf '%s' '{text}' > ~/.config/systemd/user/{name}")
+    conn.run("systemctl --user daemon-reload")
+    conn.run(f"systemctl --user enable --now {HONCHO_API_SERVICE} {HONCHO_DERIVER_SERVICE}")
+    conn.run(f"systemctl --user restart {HONCHO_API_SERVICE} {HONCHO_DERIVER_SERVICE}")
+
+    # 6. verify.
+    conn.run(
+        f"for i in $(seq 1 30); do curl -sf localhost:{HONCHO_API_PORT}/health >/dev/null 2>&1 "
+        f"&& break; sleep 1; done"
+    )
+    conn.run(f"curl -sS --max-time 10 localhost:{HONCHO_API_PORT}/health && echo")
+
+
+@task
+def deploy_all(c, host=DEFAULT_HOST, user=DEFAULT_USER, key=DEFAULT_KEY, reinstall=True):
+    """Full memory service in one flow: the codex-adapter, then the honcho stack."""
+    deploy_memory(c, host=host, user=user, key=key, reinstall=reinstall)
+    deploy_honcho(c, host=host, user=user, key=key, reinstall=reinstall)
